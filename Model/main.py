@@ -77,8 +77,8 @@ class ModelConfig:
     depth: int = 2
     ff_hidden_dim: int = 128
 
-    pos_enc_type: str = "trainable"  # "trainable" or "sinusoidal" or "none"
-    norm_type: str = "post"          # "post" or "pre"
+    pos_enc_type: str = "trainable"  
+    norm_type: str = "post"          
 
     head_dropout: float = 0.2
 
@@ -95,10 +95,10 @@ class TrainConfig:
     max_epochs: int = 84
     patience: int = 10
 
-    optimizer_name: str = "adam"   # "adam" or "adamw"
-    weight_decay: float = 0.0      # paper setting 0.0, evaluated setting can use 1e-4
+    optimizer_name: str = "adam"  
+    weight_decay: float = 0.0      
 
-    loss_name: str = "ce"          # "ce" or "cw_ce" or "focal"
+    loss_name: str = "ce"          
     focal_gamma: float = 2.0
 
     grad_clip_norm: float = 1.0
