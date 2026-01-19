@@ -780,21 +780,301 @@ if __name__ == "__main__":
         train_cfg=train_cfg,
     )
 
-    model = NT_AA(cfg=model_cfg, num_classes=3).to(device)
-    total_p, train_p = count_params(model)
+    # =========================
+# Initialize
+# =========================
+model = NT_AAR_Model_Tokens(input_dim, embed_dim=embed_dim, num_heads=4, num_classes=num_classes, T=T).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    mem_fp32_b = parameter_memory_bytes(model, 4)
-    mem_fp16_b = parameter_memory_bytes(model, 2)
-    mem_int8_b = parameter_memory_bytes(model, 1)
 
-    flops = compute_flops(model, model_cfg.T, model_cfg.input_dim)
-    inf_ms = measure_inference_time_ms(model, model_cfg.T, model_cfg.input_dim)
+# =========================
+# Parameter Count
+# =========================
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"\nTotal Parameters: {total_params:,}")
+print(f"Trainable Parameters: {trainable_params:,}")
 
-    print("\nModel stats")
-    print(f"Total params: {total_p}")
-    print(f"Trainable params: {train_p}")
-    print(f"Param memory FP32 MiB: {bytes_to_mib(mem_fp32_b):.4f}")
-    print(f"Param memory FP16 MiB: {bytes_to_mib(mem_fp16_b):.4f}")
-    print(f"Param memory INT8 MiB: {bytes_to_mib(mem_int8_b):.4f}")
-    print(f"FLOPs per forward: {flops}")
-    print(f"Inference time ms per sample: {inf_ms:.6f}")
+
+# =========================
+# FLOPs (using THOP)
+# =========================
+dummy_input = torch.randn(1, input_dim).to(device)
+flops, params = profile(model, inputs=(dummy_input,))
+print(f"FLOPs: {flops:,} | Params: {params:,}")
+
+
+# =========================
+# Prepare Data
+# =========================
+# Flatten y_train if needed
+if len(y_train.shape) > 1:
+    y_train = y_train.flatten()
+
+X_tensor = torch.tensor(X_train_flat, dtype=torch.float32)
+y_tensor = torch.tensor(y_train, dtype=torch.long)
+
+print(f"\nFinal tensor shapes:")
+print(f"X_tensor shape: {X_tensor.shape}")
+print(f"y_tensor shape: {y_tensor.shape}")
+
+total_len = len(X_tensor)
+val_len = int(0.2 * total_len)
+train_len = total_len - val_len
+
+dataset = TensorDataset(X_tensor, y_tensor)
+train_dataset, val_dataset = random_split(dataset, [train_len, val_len])
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+print(f"Train samples: {train_len}, Val samples: {val_len}\n")
+
+
+# =========================
+# ECE Implementation
+# =========================
+def expected_calibration_error(y_true, probs, n_bins=10):
+    """Compute Expected Calibration Error (ECE)."""
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    preds = np.argmax(probs, axis=1)
+    confidences = np.max(probs, axis=1)
+
+    for i in range(n_bins):
+        bin_lower, bin_upper = bin_boundaries[i], bin_boundaries[i + 1]
+        in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
+        prop_in_bin = np.mean(in_bin)
+        if prop_in_bin > 0:
+            acc_in_bin = np.mean(y_true[in_bin] == preds[in_bin])
+            avg_conf_in_bin = np.mean(confidences[in_bin])
+            ece += np.abs(acc_in_bin - avg_conf_in_bin) * prop_in_bin
+    return ece
+
+
+# =========================
+# Training
+# =========================
+best_val_loss = float('inf')
+patience_counter = 0
+train_losses, val_losses, train_accuracies, val_accuracies = [], [], [], []
+start_time = time.time()
+
+for epoch in range(num_epochs):
+    model.train()
+    running_loss, correct, total = 0.0, 0, 0
+    for batch_x, batch_y in train_loader:
+        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+        outputs = model(batch_x)
+        loss = criterion(outputs, batch_y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * batch_x.size(0)
+        predicted = torch.argmax(outputs, dim=1)
+        correct += (predicted == batch_y).sum().item()
+        total += batch_y.size(0)
+
+    train_loss = running_loss / total
+    train_acc = correct / total
+
+    # Validation
+    model.eval()
+    val_loss, val_correct, val_total = 0.0, 0, 0
+    with torch.no_grad():
+        for batch_x, batch_y in val_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+
+            val_loss += loss.item() * batch_x.size(0)
+            predicted = torch.argmax(outputs, dim=1)
+            val_correct += (predicted == batch_y).sum().item()
+            val_total += batch_y.size(0)
+
+    val_loss /= val_total
+    val_acc = val_correct / val_total
+
+    # Save metrics
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    train_accuracies.append(train_acc)
+    val_accuracies.append(val_acc)
+
+    print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f}, "
+          f"Val Loss={val_loss:.4f}, Val Acc={val_acc:.4f}")
+
+    # Early stopping
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+
+end_time = time.time()
+training_time = end_time - start_time
+print(f"\nTotal Training Time: {training_time / 60:.2f} minutes")
+
+
+# =========================
+# Final Evaluation
+# =========================
+model.eval()
+all_preds, all_true, all_probs = [], [], []
+with torch.no_grad():
+    for batch_x, batch_y in val_loader:
+        batch_x = batch_x.to(device)
+        outputs = model(batch_x)
+        probs = F.softmax(outputs, dim=1).cpu().numpy()
+        preds = np.argmax(probs, axis=1)
+
+        all_preds.extend(preds)
+        all_true.extend(batch_y.numpy())
+        all_probs.extend(probs)
+
+all_preds = np.array(all_preds)
+all_true = np.array(all_true)
+all_probs = np.array(all_probs)
+
+# Metrics
+ece = expected_calibration_error(all_true, all_probs)
+acc = accuracy_score(all_true, all_preds)
+precision = precision_score(all_true, all_preds, average="macro")
+recall = recall_score(all_true, all_preds, average="macro")
+f1 = f1_score(all_true, all_preds, average="macro")
+kappa = cohen_kappa_score(all_true, all_preds)
+
+try:
+    roc_auc = roc_auc_score(all_true, all_probs, multi_class="ovr")
+except Exception:
+    roc_auc = None
+
+print("\nPerformance Metrics:")
+print(f"Accuracy: {acc:.7f}")
+print(f"Precision: {precision:.7f}")
+print(f"Recall: {recall:.7f}")
+print(f"F1-score: {f1:.7f}")
+print(f"Cohen's Kappa: {kappa:.7f}")
+print(f"ECE: {ece:.7f}")
+if roc_auc:
+    print(f"ROC-AUC: {roc_auc:.7f}")
+
+
+# =========================
+# Collect Attention Maps
+# =========================
+print("\nCollecting attention maps...")
+model.eval()
+attn_maps = []
+
+with torch.no_grad():
+    for batch_x, batch_y in val_loader:
+        batch_x = batch_x.to(device)
+        outputs, attn_weights = model(batch_x, return_attn=True)
+        # attn_weights from MultiheadAttention: (batch, T, T) when batch_first=True
+        print(f"Batch attention weights shape: {attn_weights.shape}")
+        attn_maps.append(attn_weights.cpu().numpy())
+        break  # Just check first batch shape
+
+# Reset and collect all
+attn_maps = []
+with torch.no_grad():
+    for batch_x, batch_y in val_loader:
+        batch_x = batch_x.to(device)
+        outputs, attn_weights = model(batch_x, return_attn=True)
+        attn_maps.append(attn_weights.cpu().numpy())
+
+# Concatenate all batches
+attn_maps = np.concatenate(attn_maps, axis=0)  # (num_samples, T, T)
+print(f"Attention maps shape: {attn_maps.shape}")
+
+# Average over samples to get a 2D attention map
+avg_attn = attn_maps.mean(axis=0)  # (T, T)
+print(f"Average attention shape: {avg_attn.shape}")
+
+
+# =========================
+# Inference Time (ms/sample)
+# =========================
+n_samples = 100
+dummy_input = torch.randn(1, input_dim).to(device)
+model.eval()
+with torch.no_grad():
+    start = time.time()
+    for _ in range(n_samples):
+        _ = model(dummy_input)
+    end = time.time()
+avg_inference_time = ((end - start) / n_samples) * 1000
+print(f"\nAverage Inference Time: {avg_inference_time:.4f} ms/sample")
+
+
+# =========================
+# PLOTS
+# =========================
+# Accuracy plot
+plt.figure(figsize=(10,5))
+plt.plot(train_accuracies, label="Train Accuracy", color='blue')
+plt.plot(val_accuracies, label="Validation Accuracy", color='green')
+plt.xlabel("Epochs")
+plt.ylabel("Accuracy")
+plt.title("Training and Validation Accuracy vs Epochs")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Loss plot
+plt.figure(figsize=(10,5))
+plt.plot(train_losses, label="Train Loss", color='blue')
+plt.plot(val_losses, label="Validation Loss", color='red')
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.title("Training and Validation Loss vs Epochs")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Confusion Matrix
+cm = confusion_matrix(all_true, all_preds)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+disp.plot(cmap="Blues", values_format="d")
+plt.title("Confusion Matrix (Validation Set)")
+plt.tight_layout()
+plt.show()
+
+# Attention Map Visualization
+plt.figure(figsize=(8,7))
+im = plt.imshow(avg_attn, cmap='viridis', aspect='auto')
+plt.colorbar(im, label='Attention Weight')
+plt.xlabel("Key Token Index")
+plt.ylabel("Query Token Index")
+plt.title(f"Average Attention Map (T={T} tokens)")
+plt.xticks(range(T))
+plt.yticks(range(T))
+for i in range(T):
+    for j in range(T):
+        text = plt.text(j, i, f'{avg_attn[i, j]:.2f}',
+                       ha="center", va="center", color="white" if avg_attn[i, j] > avg_attn.max()/2 else "black",
+                       fontsize=8)
+plt.tight_layout()
+plt.show()
+
+# Save results
+save_dict = {
+    "train_accuracies": np.array(train_accuracies),
+    "val_accuracies": np.array(val_accuracies),
+    "train_losses": np.array(train_losses),
+    "val_losses": np.array(val_losses),
+    "attention_maps": attn_maps,
+    "avg_attention": avg_attn
+}
+
+np.savez("NT_AAR_training_history.npz", **save_dict)
+print("\nTraining history saved as 'NT_AAR_training_history.npz'")
